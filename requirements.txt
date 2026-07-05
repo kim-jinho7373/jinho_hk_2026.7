@@ -2,9 +2,5 @@ openai
 langchain
 langchain-community
 langchain-openai
-langchain-text-splitters
 langgraph
-faiss-cpu
-pypdf
 streamlit
-python-dotenv
