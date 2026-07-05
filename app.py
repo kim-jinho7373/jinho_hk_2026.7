@@ -13,14 +13,12 @@ st.set_page_config(page_title="하현 QA 챗봇", page_icon="🧴")
 # ---------- 사이드바: API 키 입력 ----------
 with st.sidebar:
     st.header("🔑 API 설정")
-    key_input = st.text_input(
+    st.text_input(
         "OpenAI API 키",
         type="password",
-        value=st.session_state.get("api_key", ""),
+        key="api_key_input",
         placeholder="sk-proj-...",
     )
-    if key_input:
-        st.session_state["api_key"] = key_input
     st.caption("키는 이 브라우저 세션에서만 사용되고 저장되지 않습니다.")
 
     st.divider()
@@ -32,7 +30,14 @@ with st.sidebar:
 
 
 def get_client():
-    key = st.session_state.get("api_key") or os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", "")
+    key = st.session_state.get("api_key_input", "")
+    if not key:
+        key = os.getenv("OPENAI_API_KEY", "")
+    if not key:
+        try:
+            key = st.secrets.get("OPENAI_API_KEY", "")
+        except Exception:
+            key = ""
     if not key:
         return None
     return OpenAI(api_key=key)
@@ -99,6 +104,8 @@ def read_uploaded_file(file) -> str:
 
 
 def call_llm_text(system: str, user: str, image_b64: str = None) -> str:
+    if client is None:
+        raise RuntimeError("OPENAI_API_KEY가 설정되지 않았습니다. 왼쪽 사이드바에서 키를 입력해주세요.")
     content = [{"type": "input_text", "text": user}]
     if image_b64:
         content.append({
@@ -138,7 +145,7 @@ def classify_node(state: ChatState) -> Dict[str, Any]:
         route = "copy_gen"
     elif any(k in query for k in ["비교", "타사", "경쟁사"]):
         route = "compliance_check"
-    elif any(k in query for k in ["성분", "효능", "함량", "제조", "개발", "몇 %", "몇 프로"]):
+    elif any(k in query for k in ["성분", "효능", "함량", "제조", "개발", "몇 %", "몇 프로", "장점"]):
         route = "rag"
     else:
         route = "chat"
@@ -252,6 +259,7 @@ graph = build_graph()
 # ---------- UI ----------
 st.title("🧴 하현 QA 챗봇")
 st.caption("성분·마케팅 문구·컴플라이언스 체크 · 파일/이미지 첨부 · '그래프 보여줘'로 워크플로우 확인")
+st.caption(f"🔍 디버그: API 키 인식 상태 = {'✅ 인식됨' if client else '❌ 인식 안됨'}")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -282,12 +290,15 @@ if prompt := st.chat_input("질문을 입력하세요 (예: PDRN 함량이 몇 %
                 attached_text = read_uploaded_file(uploaded_file)
 
         with st.spinner("생각 중..."):
-            result = graph.invoke({
-                "user_query": prompt,
-                "attached_text": attached_text,
-                "attached_image_b64": attached_image_b64,
-            })
-            answer = result["final_answer"]
+            try:
+                result = graph.invoke({
+                    "user_query": prompt,
+                    "attached_text": attached_text,
+                    "attached_image_b64": attached_image_b64,
+                })
+                answer = result["final_answer"]
+            except Exception as e:
+                answer = f"⚠️ 오류가 발생했습니다: {e}"
 
     with st.chat_message("assistant"):
         if answer == "__SHOW_GRAPH__":
