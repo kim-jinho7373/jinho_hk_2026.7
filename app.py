@@ -1,5 +1,6 @@
 import os
 import re
+import base64
 from typing import List, Dict, Any, TypedDict, Literal, Annotated
 import operator
 
@@ -9,12 +10,33 @@ from langgraph.graph import StateGraph, START, END
 
 st.set_page_config(page_title="하현 QA 챗봇", page_icon="🧴")
 
-# ---------- 설정 ----------
+# ---------- 사이드바: API 키 입력 ----------
+with st.sidebar:
+    st.header("🔑 API 설정")
+    key_input = st.text_input(
+        "OpenAI API 키",
+        type="password",
+        value=st.session_state.get("api_key", ""),
+        placeholder="sk-proj-...",
+    )
+    if key_input:
+        st.session_state["api_key"] = key_input
+    st.caption("키는 이 브라우저 세션에서만 사용되고 저장되지 않습니다.")
+
+    st.divider()
+    st.header("📎 첨부 파일")
+    uploaded_file = st.file_uploader(
+        "이미지 또는 문서 첨부",
+        type=["png", "jpg", "jpeg", "pdf", "txt", "md"],
+    )
+
+
 def get_client():
-    key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", "")
+    key = st.session_state.get("api_key") or os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", "")
     if not key:
         return None
     return OpenAI(api_key=key)
+
 
 client = get_client()
 MODEL = "gpt-4.1-mini"
@@ -59,11 +81,34 @@ def check_compliance(text: str) -> List[str]:
     return [kw for kw in RISKY_CLAIM_KEYWORDS if kw in text]
 
 
-def call_llm_text(system: str, user: str) -> str:
+def read_uploaded_file(file) -> str:
+    """텍스트 계열 파일 내용을 문자열로 읽어옴 (이미지는 별도 처리)."""
+    if file is None:
+        return ""
+    name = file.name.lower()
+    if name.endswith((".txt", ".md")):
+        return file.read().decode("utf-8", errors="ignore")
+    if name.endswith(".pdf"):
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(file)
+            return "\n".join(page.extract_text() or "" for page in reader.pages)
+        except Exception as e:
+            return f"[PDF 읽기 실패: {e}]"
+    return ""
+
+
+def call_llm_text(system: str, user: str, image_b64: str = None) -> str:
+    content = [{"type": "input_text", "text": user}]
+    if image_b64:
+        content.append({
+            "type": "input_image",
+            "image_url": f"data:image/png;base64,{image_b64}",
+        })
     response = client.responses.create(
         model=MODEL,
         instructions=system,
-        input=user,
+        input=[{"role": "user", "content": content}],
         temperature=0.3,
     )
     return response.output_text
@@ -77,13 +122,17 @@ class ChatState(TypedDict, total=False):
     draft_answer: str
     compliance_flags: List[str]
     final_answer: str
+    attached_text: str
+    attached_image_b64: str
     trace: Annotated[List[str], operator.add]
 
 
 # ---------- Nodes ----------
 def classify_node(state: ChatState) -> Dict[str, Any]:
     query = state["user_query"]
-    if any(k in query for k in ["그래프", "구조", "노드", "flow", "워크플로우"]):
+    if state.get("attached_text") or state.get("attached_image_b64"):
+        route = "attachment_qa"
+    elif any(k in query for k in ["그래프", "구조", "노드", "flow", "워크플로우"]):
         route = "visualize"
     elif any(k in query for k in ["문구", "카피", "마케팅", "홍보", "써줘", "작성"]):
         route = "copy_gen"
@@ -130,6 +179,17 @@ def visualize_node(state: ChatState) -> Dict[str, Any]:
     return {"draft_answer": "__SHOW_GRAPH__", "trace": ["visualize_node: render_graph"]}
 
 
+def attachment_qa_node(state: ChatState) -> Dict[str, Any]:
+    """첨부된 파일(텍스트/PDF) 또는 이미지에 대해 답하거나 요약."""
+    system = "너는 첨부 파일/이미지를 분석해 요약하거나 사용자 질문에 답하는 조교다."
+    user_parts = [f"질문: {state['user_query']}"]
+    if state.get("attached_text"):
+        user_parts.append(f"\n\n첨부 문서 내용:\n{state['attached_text'][:8000]}")
+    user = "\n".join(user_parts)
+    answer = call_llm_text(system, user, image_b64=state.get("attached_image_b64"))
+    return {"draft_answer": answer, "trace": ["attachment_qa_node: analyzed"]}
+
+
 def chat_node(state: ChatState) -> Dict[str, Any]:
     system = "너는 하현 화장품 브랜드 업무를 돕는 친절한 AI 비서다. 간결하게 답하라."
     answer = call_llm_text(system, state["user_query"])
@@ -146,7 +206,7 @@ def review_node(state: ChatState) -> Dict[str, Any]:
     return {"final_answer": draft, "trace": [f"review_node: {' / '.join(notes)}"]}
 
 
-def route_after_classify(state: ChatState) -> Literal["rag", "copy_gen", "compliance_check", "visualize", "chat"]:
+def route_after_classify(state: ChatState) -> Literal["rag", "copy_gen", "compliance_check", "visualize", "attachment_qa", "chat"]:
     return state["route"]
 
 
@@ -159,6 +219,7 @@ def build_graph():
     builder.add_node("copy_gen", copy_gen_node)
     builder.add_node("compliance_check", compliance_check_node)
     builder.add_node("visualize", visualize_node)
+    builder.add_node("attachment_qa", attachment_qa_node)
     builder.add_node("chat", chat_node)
     builder.add_node("review", review_node)
 
@@ -171,6 +232,7 @@ def build_graph():
             "copy_gen": "copy_gen",
             "compliance_check": "compliance_check",
             "visualize": "visualize",
+            "attachment_qa": "attachment_qa",
             "chat": "chat",
         },
     )
@@ -178,6 +240,7 @@ def build_graph():
     builder.add_edge("copy_gen", "review")
     builder.add_edge("compliance_check", "review")
     builder.add_edge("visualize", "review")
+    builder.add_edge("attachment_qa", "review")
     builder.add_edge("chat", "review")
     builder.add_edge("review", END)
 
@@ -188,7 +251,7 @@ graph = build_graph()
 
 # ---------- UI ----------
 st.title("🧴 하현 QA 챗봇")
-st.caption("성분·마케팅 문구·컴플라이언스 체크 · '그래프 보여줘'라고 물어보면 워크플로우 구조를 볼 수 있어요.")
+st.caption("성분·마케팅 문구·컴플라이언스 체크 · 파일/이미지 첨부 · '그래프 보여줘'로 워크플로우 확인")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -204,12 +267,26 @@ if prompt := st.chat_input("질문을 입력하세요 (예: PDRN 함량이 몇 %
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
+        if uploaded_file:
+            st.caption(f"📎 첨부: {uploaded_file.name}")
 
     if client is None:
-        answer = "⚠️ OPENAI_API_KEY가 설정되지 않았습니다."
+        answer = "⚠️ OPENAI_API_KEY가 설정되지 않았습니다. 왼쪽 사이드바에서 키를 입력해주세요."
     else:
+        attached_text = ""
+        attached_image_b64 = None
+        if uploaded_file is not None:
+            if uploaded_file.type.startswith("image/"):
+                attached_image_b64 = base64.b64encode(uploaded_file.read()).decode("utf-8")
+            else:
+                attached_text = read_uploaded_file(uploaded_file)
+
         with st.spinner("생각 중..."):
-            result = graph.invoke({"user_query": prompt})
+            result = graph.invoke({
+                "user_query": prompt,
+                "attached_text": attached_text,
+                "attached_image_b64": attached_image_b64,
+            })
             answer = result["final_answer"]
 
     with st.chat_message("assistant"):
