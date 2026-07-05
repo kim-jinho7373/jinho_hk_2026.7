@@ -1,398 +1,222 @@
-"""
-5차시 RAG QA 챗봇 Streamlit 앱
-- 4차시 Streamlit 챗봇 구조(session_state, sidebar, persona, reset)를 확장
-- RAG PDF 실습 흐름(Loader → Splitter → Storage → Retriever → Generator)을 웹앱으로 연결
-
-실행:
-  streamlit run apps/rag_chatbot_app.py
-"""
-
 import os
 import re
-import tempfile
-from pathlib import Path
-from typing import List, Tuple
+from typing import List, Dict, Any, TypedDict, Literal, Annotated
+import operator
 
 import streamlit as st
 from openai import OpenAI
+from langgraph.graph import StateGraph, START, END
 
-from langchain_core.documents import Document
-from langchain_community.document_loaders import PyPDFLoader, TextLoader
-from langchain_community.vectorstores import FAISS
-from langchain_openai import OpenAIEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+st.set_page_config(page_title="하현 QA 챗봇", page_icon="🧴")
 
+# ---------- 설정 ----------
+def get_client():
+    key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", "")
+    if not key:
+        return None
+    return OpenAI(api_key=key)
 
-st.set_page_config(
-    page_title="5차시 RAG QA 챗봇",
-    page_icon="📚",
-    layout="wide",
-)
+client = get_client()
+MODEL = "gpt-4.1-mini"
 
-DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-DEFAULT_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+# ---------- 지식베이스 ----------
+KNOWLEDGE_BASE = [
+    {
+        "title": "핵심 성분",
+        "content": "PDRN 10%(100,000ppm), 나이아신아마이드 5%, 알란토인 5%, "
+                    "8종 히알루론산 복합체, 트라넥삼산 2%, 아데노신 500ppm(제품 사용 전 대표님 확인 필요), "
+                    "비타민C 유도체, 베르가못 오일 함유.",
+    },
+    {
+        "title": "개발/제조 정보",
+        "content": "강남 소재 피부과 '플래티넘 의원'과 공동개발/협업. "
+                    "제조사는 비티바이오테라퓨틱스(주). 7월 23일 트레이드쇼 전시용 앰플.",
+    },
+    {
+        "title": "컴플라이언스 원칙",
+        "content": "경쟁사 직접 비교, 의약품 수준 효능 주장, '완치', '즉시 효과', '부작용 없음' 표현은 "
+                    "화장품법상 과장광고에 해당할 수 있어 사용을 지양해야 한다.",
+    },
+]
 
-PERSONAS = {
-    "친절한 법률 문서 조교": """
-너는 문서 기반 질의응답을 돕는 친절한 조교입니다.
-답변은 한국어로 작성하고, 어려운 표현은 쉬운 말로 풀어 설명하세요.
-제공된 문서 근거를 우선 사용하고, 법률 판단이 필요한 경우 전문가 확인을 안내하세요.
-""".strip(),
-    "엄격한 RAG 검증관": """
-너는 문서 근거를 매우 엄격하게 확인하는 RAG 검증관입니다.
-제공된 문서에 없는 내용은 추측하지 않습니다.
-근거가 부족하면 '업로드된 문서에서 근거를 찾기 어렵습니다'라고 답하세요.
-""".strip(),
-    "요약 중심 문서봇": """
-너는 긴 문서를 짧고 구조적으로 요약해주는 문서봇입니다.
-답변은 핵심 결론 → 근거 → 주의사항 순서로 작성하세요.
-""".strip(),
-}
-
-SENSITIVE_PATTERNS = {
-    "api_key": r"sk-[A-Za-z0-9_\-]{10,}",
-    "korean_rrn": r"\b\d{6}-\d{7}\b",
-    "phone": r"\b01[016789]-?\d{3,4}-?\d{4}\b",
-    "email": r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
-    "password_hint": r"(?i)(password|passwd|비밀번호|암호)\s*[:=]",
-}
+RISKY_CLAIM_KEYWORDS = ["최고", "1위", "완치", "즉시 효과", "타사 대비", "부작용 없음", "의약품 수준"]
 
 
-def get_api_key_from_env_or_secrets() -> str:
-    try:
-        if "OPENAI_API_KEY" in st.secrets:
-            return st.secrets["OPENAI_API_KEY"]
-    except Exception:
-        pass
-    return os.getenv("OPENAI_API_KEY", "")
+def simple_retrieve(query: str, top_k: int = 2) -> List[Dict[str, Any]]:
+    query_terms = set(re.findall(r"[가-힣A-Za-z0-9]+", query.lower()))
+    scored = []
+    for doc in KNOWLEDGE_BASE:
+        text = (doc["title"] + " " + doc["content"]).lower()
+        doc_terms = set(re.findall(r"[가-힣A-Za-z0-9]+", text))
+        score = len(query_terms & doc_terms)
+        if score > 0:
+            scored.append((score, doc))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [doc for _, doc in scored[:top_k]] or KNOWLEDGE_BASE[:top_k]
 
 
-def detect_sensitive_info(text: str) -> List[str]:
-    hits = []
-    for name, pattern in SENSITIVE_PATTERNS.items():
-        if re.search(pattern, text):
-            hits.append(name)
-    return hits
+def check_compliance(text: str) -> List[str]:
+    return [kw for kw in RISKY_CLAIM_KEYWORDS if kw in text]
 
 
-@st.cache_resource(show_spinner=False)
-def get_client(api_key: str) -> OpenAI:
-    return OpenAI(api_key=api_key)
-
-
-def load_documents_from_path(path: str) -> List[Document]:
-    suffix = Path(path).suffix.lower()
-    if suffix == ".pdf":
-        return PyPDFLoader(path).load()
-    if suffix in [".txt", ".md"]:
-        return TextLoader(path, encoding="utf-8").load()
-    raise ValueError("지원하지 않는 파일 형식입니다. PDF, TXT, MD만 사용하세요.")
-
-
-@st.cache_resource(show_spinner="문서를 읽고 벡터 DB를 만드는 중입니다...")
-def build_vectorstore_from_bytes(
-    file_bytes: bytes,
-    file_name: str,
-    chunk_size: int,
-    chunk_overlap: int,
-    embedding_model: str,
-    api_key: str,
-) -> Tuple[FAISS, str, int]:
-    os.environ["OPENAI_API_KEY"] = api_key
-
-    suffix = Path(file_name).suffix.lower() or ".txt"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(file_bytes)
-        tmp_path = tmp.name
-
-    try:
-        docs = load_documents_from_path(tmp_path)
-    finally:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-
-    for doc in docs:
-        doc.metadata["source"] = file_name
-
-    raw_text = "\n\n".join(doc.page_content for doc in docs)
-
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        separators=["\n\n", "\n", ". ", " ", ""],
+def call_llm_text(system: str, user: str) -> str:
+    response = client.responses.create(
+        model=MODEL,
+        instructions=system,
+        input=user,
+        temperature=0.3,
     )
-    splits = splitter.split_documents(docs)
-
-    embeddings = OpenAIEmbeddings(model=embedding_model)
-    vectorstore = FAISS.from_documents(splits, embeddings)
-    return vectorstore, raw_text, len(splits)
-
-
-def format_docs(docs: List[Document]) -> str:
-    blocks = []
-    for i, doc in enumerate(docs, 1):
-        source = doc.metadata.get("source", "unknown")
-        page = doc.metadata.get("page", None)
-        page_text = f", page={page + 1}" if isinstance(page, int) else ""
-        blocks.append(
-            f"[문서 {i}] source={source}{page_text}\n{doc.page_content}"
-        )
-    return "\n\n---\n\n".join(blocks)
-
-
-def call_openai_text(
-    client: OpenAI,
-    model: str,
-    instructions: str,
-    input_text: str,
-    max_output_tokens: int = 900,
-    temperature: float | None = None,
-) -> str:
-    kwargs = {
-        "model": model,
-        "instructions": instructions,
-        "input": input_text,
-        "max_output_tokens": max_output_tokens,
-        "store": False,
-    }
-    if temperature is not None:
-        kwargs["temperature"] = temperature
-
-    try:
-        response = client.responses.create(**kwargs)
-    except Exception as exc:
-        # 일부 추론 모델은 temperature를 지원하지 않을 수 있어 한 번 재시도합니다.
-        if "temperature" in str(exc).lower() and "temperature" in kwargs:
-            kwargs.pop("temperature", None)
-            response = client.responses.create(**kwargs)
-        else:
-            raise
     return response.output_text
 
 
-def generate_rag_answer(
-    client: OpenAI,
-    model: str,
-    query: str,
-    docs: List[Document],
-    persona: str,
-    strict_mode: bool,
-    temperature: float,
-) -> str:
-    context = format_docs(docs)
-    strict_rule = (
-        "문서에 직접 근거가 없으면 추측하지 말고 '업로드된 문서에서 근거를 찾기 어렵습니다'라고 답하세요."
-        if strict_mode
-        else "문서 근거를 우선 사용하되, 문서 밖 일반 상식이 필요하면 반드시 '문서 밖 일반 설명'이라고 표시하세요."
+# ---------- State ----------
+class ChatState(TypedDict, total=False):
+    user_query: str
+    route: str
+    retrieved_docs: List[Dict[str, Any]]
+    draft_answer: str
+    compliance_flags: List[str]
+    final_answer: str
+    trace: Annotated[List[str], operator.add]
+
+
+# ---------- Nodes ----------
+def classify_node(state: ChatState) -> Dict[str, Any]:
+    query = state["user_query"]
+    if any(k in query for k in ["그래프", "구조", "노드", "flow", "워크플로우"]):
+        route = "visualize"
+    elif any(k in query for k in ["문구", "카피", "마케팅", "홍보", "써줘", "작성"]):
+        route = "copy_gen"
+    elif any(k in query for k in ["비교", "타사", "경쟁사"]):
+        route = "compliance_check"
+    elif any(k in query for k in ["성분", "효능", "함량", "제조", "개발", "몇 %", "몇 프로"]):
+        route = "rag"
+    else:
+        route = "chat"
+    return {"route": route, "trace": [f"classify_node: route={route}"]}
+
+
+def rag_node(state: ChatState) -> Dict[str, Any]:
+    docs = simple_retrieve(state["user_query"], top_k=2)
+    context = "\n\n".join([f"[{d['title']}] {d['content']}" for d in docs])
+    system = "너는 하현(Hahyeon) 화장품 브랜드의 제품 정보 조교다. 문서 근거만으로 답하고, 근거 없으면 모른다고 답하라."
+    user = f"질문: {state['user_query']}\n\n근거 문서:\n{context}"
+    answer = call_llm_text(system, user)
+    return {"retrieved_docs": docs, "draft_answer": answer, "trace": [f"rag_node: docs={len(docs)}"]}
+
+
+def copy_gen_node(state: ChatState) -> Dict[str, Any]:
+    docs = simple_retrieve(state["user_query"], top_k=2)
+    context = "\n\n".join([f"[{d['title']}] {d['content']}" for d in docs])
+    system = "너는 화장품 마케팅 카피라이터다. 근거 문서에 있는 성분/사실만 언급해서 문구를 작성하라."
+    user = f"요청: {state['user_query']}\n\n근거 문서:\n{context}"
+    draft = call_llm_text(system, user)
+    flags = check_compliance(draft)
+    if flags:
+        draft += f"\n\n⚠️ 검토 필요 표현: {flags} (화장품법상 과장광고 소지 있음)"
+    return {"draft_answer": draft, "compliance_flags": flags, "trace": [f"copy_gen_node: flags={flags}"]}
+
+
+def compliance_check_node(state: ChatState) -> Dict[str, Any]:
+    answer = (
+        "경쟁사와의 직접 비교, 의약품 수준 효능 주장, '완치'·'즉시 효과'·'부작용 없음' 같은 표현은 "
+        "화장품법상 과장광고로 간주될 수 있어 사용을 지양해야 합니다.\n\n"
+        "대신 자사 제품의 성분·함량 등 객관적 사실 위주로 표현하는 것을 권장합니다."
     )
+    return {"draft_answer": answer, "trace": ["compliance_check_node: policy_reminder"]}
 
-    instructions = f"""
-{persona}
 
-[공통 규칙]
-- 답변은 한국어로 작성합니다.
-- 아래 제공된 문서 근거를 우선 사용합니다.
-- {strict_rule}
-- 답변 마지막에 '참고한 문서'를 문서 번호로 표시합니다.
-- 법률, 의료, 금융 등 고위험 판단은 전문가 확인이 필요하다고 안내합니다.
-""".strip()
+def visualize_node(state: ChatState) -> Dict[str, Any]:
+    return {"draft_answer": "__SHOW_GRAPH__", "trace": ["visualize_node: render_graph"]}
 
-    input_text = f"""
-[사용자 질문]
-{query}
 
-[검색된 문서 근거]
-{context}
+def chat_node(state: ChatState) -> Dict[str, Any]:
+    system = "너는 하현 화장품 브랜드 업무를 돕는 친절한 AI 비서다. 간결하게 답하라."
+    answer = call_llm_text(system, state["user_query"])
+    return {"draft_answer": answer, "trace": ["chat_node: general"]}
 
-[답변 형식]
-1. 핵심 답변
-2. 근거 요약
-3. 주의사항
-4. 참고한 문서
-""".strip()
 
-    return call_openai_text(
-        client=client,
-        model=model,
-        instructions=instructions,
-        input_text=input_text,
-        max_output_tokens=1100,
-        temperature=temperature,
+def review_node(state: ChatState) -> Dict[str, Any]:
+    draft = state.get("draft_answer", "")
+    notes = []
+    if state.get("compliance_flags"):
+        notes.append(f"과장광고 위험 표현 감지: {state['compliance_flags']}")
+    if not notes:
+        notes.append("검토 통과")
+    return {"final_answer": draft, "trace": [f"review_node: {' / '.join(notes)}"]}
+
+
+def route_after_classify(state: ChatState) -> Literal["rag", "copy_gen", "compliance_check", "visualize", "chat"]:
+    return state["route"]
+
+
+# ---------- Graph build ----------
+@st.cache_resource
+def build_graph():
+    builder = StateGraph(ChatState)
+    builder.add_node("classify", classify_node)
+    builder.add_node("rag", rag_node)
+    builder.add_node("copy_gen", copy_gen_node)
+    builder.add_node("compliance_check", compliance_check_node)
+    builder.add_node("visualize", visualize_node)
+    builder.add_node("chat", chat_node)
+    builder.add_node("review", review_node)
+
+    builder.add_edge(START, "classify")
+    builder.add_conditional_edges(
+        "classify",
+        route_after_classify,
+        {
+            "rag": "rag",
+            "copy_gen": "copy_gen",
+            "compliance_check": "compliance_check",
+            "visualize": "visualize",
+            "chat": "chat",
+        },
     )
+    builder.add_edge("rag", "review")
+    builder.add_edge("copy_gen", "review")
+    builder.add_edge("compliance_check", "review")
+    builder.add_edge("visualize", "review")
+    builder.add_edge("chat", "review")
+    builder.add_edge("review", END)
+
+    return builder.compile()
 
 
-def generate_summary(client: OpenAI, model: str, raw_text: str, temperature: float = 0.0) -> str:
-    clipped = raw_text[:14000]
-    instructions = """
-너는 문서 요약 전문가입니다. 한국어로 Notion 스타일 요약을 만듭니다.
-중요 내용만 구조화하고, 문서에 없는 내용은 추가하지 않습니다.
-""".strip()
-    input_text = f"""
-아래 문서를 요약하세요.
+graph = build_graph()
 
-[출력 형식]
-# 한 문장 요약
-# 핵심 항목 5개
-# 질문해볼 만한 내용 5개
-# 주의사항
+# ---------- UI ----------
+st.title("🧴 하현 QA 챗봇")
+st.caption("성분·마케팅 문구·컴플라이언스 체크 · '그래프 보여줘'라고 물어보면 워크플로우 구조를 볼 수 있어요.")
 
-[문서]
-{clipped}
-""".strip()
-    return call_openai_text(client, model, instructions, input_text, 1200, temperature)
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-
-def ensure_session_state() -> None:
-    if "messages" not in st.session_state:
-        st.session_state.messages = [
-            {
-                "role": "assistant",
-                "content": "안녕하세요! 문서를 업로드하거나 샘플 문서를 선택한 뒤 질문해 주세요. '요약'이라고 입력하면 문서 요약을 생성합니다.",
-            }
-        ]
-    if "vectorstore" not in st.session_state:
-        st.session_state.vectorstore = None
-    if "raw_text" not in st.session_state:
-        st.session_state.raw_text = ""
-    if "last_sources" not in st.session_state:
-        st.session_state.last_sources = []
-
-
-ensure_session_state()
-
-st.markdown(
-    """
-<style>
-.block-container {padding-top: 2rem;}
-.small-caption {font-size: 0.85rem; color: #666;}
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
-st.title("📚 5차시 GPT API 기반 RAG QA 챗봇")
-st.caption("Loader → Splitter → Storage → Retriever → Generator 흐름을 Streamlit으로 확인합니다.")
-
-with st.sidebar:
-    st.header("🔐 API 설정")
-    api_key_input = st.text_input("OPENAI_API_KEY", type="password", help="비워두면 st.secrets 또는 환경변수를 사용합니다.")
-    api_key = api_key_input or get_api_key_from_env_or_secrets()
-    model = st.text_input("생성 모델", value=DEFAULT_MODEL)
-    embedding_model = st.text_input("임베딩 모델", value=DEFAULT_EMBEDDING_MODEL)
-
-    st.header("📄 문서 설정")
-    uploaded_file = st.file_uploader("문서를 업로드하세요", type=["pdf", "txt", "md"])
-    use_sample = st.checkbox("샘플 문서 사용", value=uploaded_file is None)
-
-    chunk_size = st.slider("Chunk size", min_value=300, max_value=1800, value=900, step=100)
-    chunk_overlap = st.slider("Chunk overlap", min_value=0, max_value=500, value=150, step=50)
-    top_k = st.slider("Retriever Top-k", min_value=1, max_value=8, value=3, step=1)
-
-    st.header("🤖 답변 설정")
-    persona_name = st.selectbox("페르소나", list(PERSONAS.keys()))
-    temperature = st.slider("temperature", min_value=0.0, max_value=1.0, value=0.0, step=0.1)
-    strict_mode = st.checkbox("문서 근거 엄격 모드", value=True)
-
-    if st.button("문서 인덱싱", type="primary", use_container_width=True):
-        if not api_key:
-            st.error("OPENAI_API_KEY가 필요합니다.")
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        if msg["content"] == "__SHOW_GRAPH__":
+            st.image(graph.get_graph().draw_mermaid_png())
         else:
-            if uploaded_file is not None:
-                file_bytes = uploaded_file.getvalue()
-                file_name = uploaded_file.name
-            elif use_sample:
-                sample_path = Path(__file__).resolve().parents[1] / "sample_docs" / "house_lease_law_sample.txt"
-                file_bytes = sample_path.read_bytes()
-                file_name = sample_path.name
-            else:
-                st.warning("업로드 파일을 선택하거나 샘플 문서를 사용하세요.")
-                st.stop()
+            st.markdown(msg["content"])
 
-            vectorstore, raw_text, n_splits = build_vectorstore_from_bytes(
-                file_bytes=file_bytes,
-                file_name=file_name,
-                chunk_size=chunk_size,
-                chunk_overlap=chunk_overlap,
-                embedding_model=embedding_model,
-                api_key=api_key,
-            )
-            st.session_state.vectorstore = vectorstore
-            st.session_state.raw_text = raw_text
-            st.success(f"인덱싱 완료: {file_name} / {n_splits}개 chunk")
-
-    if st.button("대화 초기화", use_container_width=True):
-        st.session_state.messages = [
-            {"role": "assistant", "content": "대화를 초기화했습니다. 새 질문을 입력하세요."}
-        ]
-        st.session_state.last_sources = []
-        st.rerun()
-
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-
-prompt = st.chat_input("질문을 입력하세요. 예: 확정일자는 어디서 받나요? / 요약")
-
-if prompt:
+if prompt := st.chat_input("질문을 입력하세요 (예: PDRN 함량이 몇 %야?)"):
     st.session_state.messages.append({"role": "user", "content": prompt})
-
-    if prompt.strip().lower() in ["/reset", "reset"]:
-        st.session_state.messages = [
-            {"role": "assistant", "content": "대화를 초기화했습니다. 새 질문을 입력하세요."}
-        ]
-        st.rerun()
-
     with st.chat_message("user"):
         st.markdown(prompt)
 
+    if client is None:
+        answer = "⚠️ OPENAI_API_KEY가 설정되지 않았습니다."
+    else:
+        with st.spinner("생각 중..."):
+            result = graph.invoke({"user_query": prompt})
+            answer = result["final_answer"]
+
     with st.chat_message("assistant"):
-        try:
-            hits = detect_sensitive_info(prompt)
-            if hits:
-                answer = f"민감정보로 보이는 내용이 포함되어 답변을 중단했습니다. 감지 항목: {hits}"
-            elif not api_key:
-                answer = "OPENAI_API_KEY가 설정되어 있지 않습니다. 사이드바에서 입력하거나 환경변수/st.secrets를 설정하세요."
-            elif st.session_state.vectorstore is None:
-                answer = "먼저 사이드바에서 문서를 업로드하거나 샘플 문서를 선택한 뒤 '문서 인덱싱'을 눌러주세요."
-            else:
-                client = get_client(api_key)
-                if prompt.strip() == "요약":
-                    answer = generate_summary(client, model, st.session_state.raw_text, temperature)
-                elif prompt.strip() == "/출처":
-                    if st.session_state.last_sources:
-                        answer = "\n\n".join(st.session_state.last_sources)
-                    else:
-                        answer = "아직 표시할 출처가 없습니다. 먼저 문서 질문을 해주세요."
-                else:
-                    docs = st.session_state.vectorstore.similarity_search(prompt, k=top_k)
-                    st.session_state.last_sources = [
-                        f"문서 {i+1}: {doc.metadata.get('source', 'unknown')}"
-                        + (f" / page {doc.metadata.get('page') + 1}" if isinstance(doc.metadata.get('page'), int) else "")
-                        + f"\n> {doc.page_content[:220].replace(chr(10), ' ')}..."
-                        for i, doc in enumerate(docs)
-                    ]
-                    answer = generate_rag_answer(
-                        client=client,
-                        model=model,
-                        query=prompt,
-                        docs=docs,
-                        persona=PERSONAS[persona_name],
-                        strict_mode=strict_mode,
-                        temperature=temperature,
-                    )
-
+        if answer == "__SHOW_GRAPH__":
+            st.write("현재 챗봇의 워크플로우 구조입니다:")
+            st.image(graph.get_graph().draw_mermaid_png())
+        else:
             st.markdown(answer)
-            with st.expander("마지막 검색 출처 보기", expanded=False):
-                if st.session_state.last_sources:
-                    for src in st.session_state.last_sources:
-                        st.markdown(src)
-                else:
-                    st.caption("검색 출처가 없습니다.")
-
-        except Exception as exc:
-            answer = f"오류가 발생했습니다: {exc}"
-            st.error(answer)
 
     st.session_state.messages.append({"role": "assistant", "content": answer})
